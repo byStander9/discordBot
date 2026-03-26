@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import random
 import re
 import os
@@ -110,13 +109,30 @@ class LoopMode:
         return cls._labels.get(mode, "알 수 없음")
 
 
+AUTOPLAY_PRESETS: dict[str, str] = {
+    "애니": "anime OST",
+    "팝": "pop music",
+    "록": "rock music",
+    "재즈": "jazz",
+    "클래식": "classical music",
+    "힙합": "hip hop",
+    "R&B": "R&B soul",
+    "EDM": "EDM electronic",
+    "발라드": "Korean ballad",
+    "JPOP": "J-POP Japanese",
+    "KPOP": "K-POP Korean",
+    "게임": "game OST soundtrack",
+    "로파이": "lofi chill",
+}
+
+
 @dataclass
 class GuildState:
     queue: list[Song] = field(default_factory=list)
     current: Song | None = None
     loop: int = LoopMode.OFF
     autoplay: bool = True
-    skip_votes: set[int] = field(default_factory=set)
+    autoplay_tag: str = ""
     history: list[str] = field(default_factory=list)
     _inactivity_task: asyncio.Task | None = field(default=None, repr=False)
 
@@ -255,79 +271,6 @@ class SearchButton(discord.ui.Button["SearchSelectView"]):
         self.view.stop()
 
 
-class SkipVoteView(discord.ui.View):
-    """A persistent button for skip voting."""
-
-    def __init__(self, cog: Music, guild: discord.Guild, required: int, timeout: float = 60):
-        super().__init__(timeout=timeout)
-        self.cog = cog
-        self.guild = guild
-        self.required = required
-        self.voters: set[int] = set()
-        self.resolved = False
-        self.message: discord.Message | None = None
-
-    def _vote_label(self) -> str:
-        return f"스킵 투표 ({len(self.voters)}/{self.required})"
-
-    @discord.ui.button(label="스킵 투표 (0/0)", style=discord.ButtonStyle.danger, emoji="⏭️")
-    async def vote_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        vc = self.guild.voice_client
-        if not vc or not vc.channel:
-            await interaction.response.send_message("봇이 음성 채널에 없습니다.", ephemeral=True)
-            return
-
-        if not interaction.user.voice or interaction.user.voice.channel != vc.channel:
-            await interaction.response.send_message("같은 음성 채널에 있어야 투표할 수 있습니다.", ephemeral=True)
-            return
-
-        self.voters.add(interaction.user.id)
-
-        # Recalculate required in case people left/joined
-        humans = [m for m in vc.channel.members if not m.bot]
-        self.required = math.ceil(len(humans) / 2)
-        button.label = self._vote_label()
-
-        if len(self.voters) >= self.required:
-            self.resolved = True
-            button.label = "스킵 투표 통과!"
-            button.disabled = True
-            button.style = discord.ButtonStyle.success
-            await interaction.response.edit_message(view=self)
-            self.stop()
-
-            state = self.cog._state(self.guild)
-            state.skip_votes.clear()
-            if vc.is_playing():
-                vc.stop()
-        else:
-            voter_names = []
-            for vid in self.voters:
-                member = self.guild.get_member(vid)
-                if member:
-                    voter_names.append(member.display_name)
-            embed = interaction.message.embeds[0] if interaction.message.embeds else None
-            if embed:
-                for i, f in enumerate(embed.fields):
-                    if f.name == "투표 현황":
-                        embed.set_field_at(i, name="투표 현황", value=", ".join(voter_names) or "-", inline=False)
-                        break
-                await interaction.response.edit_message(embed=embed, view=self)
-            else:
-                await interaction.response.edit_message(view=self)
-
-    async def on_timeout(self) -> None:
-        if not self.resolved:
-            for child in self.children:
-                child.disabled = True  # type: ignore[union-attr]
-                child.label = "투표 시간 만료"  # type: ignore[union-attr]
-            if self.message:
-                try:
-                    await self.message.edit(view=self)
-                except Exception:
-                    pass
-
-
 # ---------------------------------------------------------------------------
 # Cog
 # ---------------------------------------------------------------------------
@@ -401,8 +344,6 @@ class Music(commands.Cog):
         if vc is None:
             return
 
-        state.skip_votes.clear()
-
         # Loop single
         if state.loop == LoopMode.SINGLE and state.current:
             await self._start_playing(guild, state.current)
@@ -462,6 +403,8 @@ class Music(commands.Cog):
         keywords = _keywords_from_title(song.title)
         if not keywords.strip():
             return None
+        if state.autoplay_tag:
+            keywords = f"{keywords} {state.autoplay_tag}"
         try:
             results = await search_youtube(keywords, loop=self.bot.loop)
         except Exception:
@@ -631,50 +574,17 @@ class Music(commands.Cog):
         await interaction.response.send_message("⏹️ 재생이 중지되고 대기열이 초기화되었습니다.")
 
     # ------------------------------------------------------------------
-    # Vote skip
+    # Skip
     # ------------------------------------------------------------------
 
-    @app_commands.command(name="skip", description="투표를 통해 현재 노래를 건너뜁니다.")
+    @app_commands.command(name="skip", description="현재 노래를 건너뜁니다.")
     async def skip(self, interaction: discord.Interaction) -> None:
         vc = interaction.guild.voice_client
         if not vc or not vc.is_playing():
             await interaction.response.send_message("재생 중인 노래가 없습니다.", ephemeral=True)
             return
-
-        if not interaction.user.voice or interaction.user.voice.channel != vc.channel:
-            await interaction.response.send_message("같은 음성 채널에 있어야 합니다.", ephemeral=True)
-            return
-
-        humans = [m for m in vc.channel.members if not m.bot]
-        required = math.ceil(len(humans) / 2)
-
-        # 혼자 있는 경우 즉시 스킵
-        if required <= 1:
-            state = self._state(interaction.guild)
-            state.skip_votes.clear()
-            vc.stop()
-            await interaction.response.send_message("⏭️ 다음 곡으로 넘어갑니다.")
-            return
-
-        state = self._state(interaction.guild)
-        current_title = state.current.title if state.current else "현재 곡"
-
-        view = SkipVoteView(cog=self, guild=interaction.guild, required=required, timeout=60)
-        view.voters.add(interaction.user.id)
-        view.vote_button.label = view._vote_label()
-
-        embed = discord.Embed(
-            title="⏭️ 스킵 투표",
-            description=f"**{current_title}**\n\n"
-                        f"채널 인원의 과반수({required}명)가 투표하면 스킵됩니다.\n"
-                        f"아래 버튼을 클릭하거나 `/skip`을 입력해 투표하세요.",
-            color=discord.Color.red(),
-        )
-        embed.add_field(name="투표 현황", value=interaction.user.display_name, inline=False)
-
-        await interaction.response.send_message(embed=embed, view=view)
-        msg = await interaction.original_response()
-        view.message = msg
+        vc.stop()
+        await interaction.response.send_message("⏭️ 다음 곡으로 넘어갑니다.")
 
     # ------------------------------------------------------------------
     # Queue management
@@ -708,7 +618,8 @@ class Music(commands.Cog):
         )
         loop_label = LoopMode.label(state.loop)
         autoplay_label = "켜짐" if state.autoplay else "꺼짐"
-        embed.set_footer(text=f"반복: {loop_label} | 자동재생: {autoplay_label} | 총 {len(state.queue)}곡 대기 중")
+        tag_info = f" ({state.autoplay_tag})" if state.autoplay_tag else ""
+        embed.set_footer(text=f"반복: {loop_label} | 자동재생: {autoplay_label}{tag_info} | 총 {len(state.queue)}곡 대기 중")
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="remove", description="대기열에서 특정 곡을 제거합니다.")
@@ -747,12 +658,35 @@ class Music(commands.Cog):
         random.shuffle(state.queue)
         await interaction.response.send_message(f"🔀 대기열 {len(state.queue)}곡을 셔플했습니다.")
 
-    @app_commands.command(name="autoplay", description="대기열이 비었을 때 유사곡 자동재생을 켜거나 끕니다.")
-    async def autoplay(self, interaction: discord.Interaction) -> None:
+    @app_commands.command(name="autoplay", description="자동재생을 켜거나 끄고, 선호 장르를 설정합니다.")
+    @app_commands.describe(genre="선호 장르 (비워두면 토글, 'off'로 태그 해제)")
+    async def autoplay(self, interaction: discord.Interaction, genre: str | None = None) -> None:
         state = self._state(interaction.guild)
-        state.autoplay = not state.autoplay
-        label = "켜짐" if state.autoplay else "꺼짐"
-        await interaction.response.send_message(f"📻 자동재생: **{label}**")
+
+        if genre is None:
+            state.autoplay = not state.autoplay
+            label = "켜짐" if state.autoplay else "꺼짐"
+            tag_info = f" (장르: {state.autoplay_tag})" if state.autoplay_tag else ""
+            await interaction.response.send_message(f"📻 자동재생: **{label}**{tag_info}")
+            return
+
+        genre_input = genre.strip()
+
+        if genre_input.lower() == "off":
+            state.autoplay_tag = ""
+            await interaction.response.send_message("📻 자동재생 장르 태그가 해제되었습니다.")
+            return
+
+        resolved = AUTOPLAY_PRESETS.get(genre_input, genre_input)
+        state.autoplay_tag = resolved
+        state.autoplay = True
+
+        preset_list = ", ".join(f"`{k}`" for k in AUTOPLAY_PRESETS)
+        await interaction.response.send_message(
+            f"📻 자동재생: **켜짐** | 장르: **{genre_input}** (`{resolved}`)\n"
+            f"사용 가능한 프리셋: {preset_list}\n"
+            f"프리셋 외 직접 입력도 가능합니다."
+        )
 
     # ------------------------------------------------------------------
     # Search
