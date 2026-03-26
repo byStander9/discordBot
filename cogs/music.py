@@ -172,7 +172,8 @@ def _keywords_from_title(title: str) -> str:
 # ---------------------------------------------------------------------------
 
 class SearchSelectView(discord.ui.View):
-    """Presents numbered buttons (1-5) for the user to pick a search result."""
+    """Presents numbered buttons (1-5) for the user to pick a search result.
+    Also accepts chat input (1-5 or 'c' to cancel) in parallel."""
 
     def __init__(self, results: list[dict], requester: discord.Member, cog: Music, timeout: float = 30):
         super().__init__(timeout=timeout)
@@ -181,9 +182,45 @@ class SearchSelectView(discord.ui.View):
         self.cog = cog
         self.picked: dict | None = None
         self.interaction_response: discord.Interaction | None = None
+        self._message_task: asyncio.Task | None = None
 
         for i in range(min(len(results), 5)):
             self.add_item(SearchButton(index=i, label=str(i + 1)))
+
+    def start_message_listener(self, bot: commands.Bot, channel: discord.abc.Messageable) -> None:
+        """Start listening for chat input alongside button clicks."""
+        self._message_task = asyncio.create_task(self._wait_for_message(bot, channel))
+
+    async def _wait_for_message(self, bot: commands.Bot, channel: discord.abc.Messageable) -> None:
+        def check(m: discord.Message) -> bool:
+            if m.author.id != self.requester.id or m.channel.id != channel.id:
+                return False
+            return m.content.strip() in ("1", "2", "3", "4", "5", "c", "cancel")
+
+        try:
+            msg = await bot.wait_for("message", check=check, timeout=self.timeout)
+        except asyncio.TimeoutError:
+            return
+
+        content = msg.content.strip().lower()
+        if content in ("c", "cancel"):
+            self.picked = None
+        else:
+            idx = int(content) - 1
+            if 0 <= idx < len(self.results):
+                self.picked = self.results[idx]
+
+        self._disable_buttons()
+        if self.interaction_response:
+            try:
+                await self.interaction_response.edit_original_response(view=self)
+            except Exception:
+                pass
+        self.stop()
+
+    def _disable_buttons(self) -> None:
+        for child in self.children:
+            child.disabled = True  # type: ignore[union-attr]
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.requester.id:
@@ -191,9 +228,13 @@ class SearchSelectView(discord.ui.View):
             return False
         return True
 
+    def _cancel_message_task(self) -> None:
+        if self._message_task and not self._message_task.done():
+            self._message_task.cancel()
+
     async def on_timeout(self) -> None:
-        for child in self.children:
-            child.disabled = True  # type: ignore[union-attr]
+        self._cancel_message_task()
+        self._disable_buttons()
         if self.interaction_response:
             try:
                 await self.interaction_response.edit_original_response(view=self)
@@ -208,8 +249,8 @@ class SearchButton(discord.ui.Button["SearchSelectView"]):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         self.view.picked = self.view.results[self.index]
-        for child in self.view.children:
-            child.disabled = True  # type: ignore[union-attr]
+        self.view._cancel_message_task()
+        self.view._disable_buttons()
         await interaction.response.edit_message(view=self.view)
         self.view.stop()
 
@@ -521,11 +562,12 @@ class Music(commands.Cog):
                 description="\n".join(lines),
                 color=discord.Color.blue(),
             )
-            embed.set_footer(text="30초 내에 버튼을 눌러 선택하세요.")
+            embed.set_footer(text="30초 내에 버튼을 클릭하거나 번호를 채팅으로 입력하세요. (취소: c)")
 
             view = SearchSelectView(results[:5], interaction.user, self)
             msg = await interaction.followup.send(embed=embed, view=view)
             view.interaction_response = interaction
+            view.start_message_listener(self.bot, interaction.channel)
 
             timed_out = await view.wait()
             if timed_out or view.picked is None:
@@ -741,11 +783,12 @@ class Music(commands.Cog):
             description="\n".join(lines),
             color=discord.Color.blue(),
         )
-        embed.set_footer(text="30초 내에 버튼을 눌러 선택하세요.")
+        embed.set_footer(text="30초 내에 버튼을 클릭하거나 번호를 채팅으로 입력하세요. (취소: c)")
 
         view = SearchSelectView(results[:5], interaction.user, self)
         await interaction.followup.send(embed=embed, view=view)
         view.interaction_response = interaction
+        view.start_message_listener(self.bot, interaction.channel)
 
         timed_out = await view.wait()
         if timed_out or view.picked is None:
