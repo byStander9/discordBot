@@ -5,6 +5,8 @@ import logging
 import math
 import random
 import re
+import os
+import shutil
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -26,13 +28,29 @@ YDL_BASE_OPTS: dict = {
     "source_address": "0.0.0.0",
 }
 
-YDL_SEARCH_OPTS: dict = {**YDL_BASE_OPTS, "default_search": "ytsearch5", "extract_flat": True}
+YDL_SEARCH_OPTS: dict = {**YDL_BASE_OPTS, "default_search": "ytsearch5", "extract_flat": "in_playlist"}
 
 YDL_EXTRACT_OPTS: dict = {
     **YDL_BASE_OPTS,
     "format": "bestaudio/best",
     "default_search": "ytsearch",
 }
+
+def _find_ffmpeg() -> str:
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    common_paths = [
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+    ]
+    for p in common_paths:
+        if os.path.isfile(p):
+            return p
+    return "ffmpeg"
+
+
+FFMPEG_PATH: str = _find_ffmpeg()
 
 FFMPEG_OPTS: dict = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
@@ -109,12 +127,12 @@ async def search_youtube(query: str, *, loop: asyncio.AbstractEventLoop) -> list
     """Return flat search results (title, url, duration)."""
     with yt_dlp.YoutubeDL(YDL_SEARCH_OPTS) as ydl:
         data = await loop.run_in_executor(None, lambda: ydl.extract_info(query, download=False))
-    entries = data.get("entries", [])
+    entries = list(data.get("entries", []))
     return [
         {
             "title": e.get("title", "Unknown"),
-            "url": e.get("url", ""),
-            "duration": e.get("duration", 0) or 0,
+            "url": e.get("url") or e.get("webpage_url", ""),
+            "duration": int(e.get("duration", 0) or 0),
         }
         for e in entries
         if e
@@ -258,6 +276,7 @@ class Music(commands.Cog):
     def __init__(self, bot: MusicBot) -> None:
         self.bot = bot
         self.states: dict[int, GuildState] = {}
+        log.info("FFmpeg path: %s", FFMPEG_PATH)
 
     def _state(self, guild: discord.Guild) -> GuildState:
         if guild.id not in self.states:
@@ -353,7 +372,7 @@ class Music(commands.Cog):
         vc: discord.VoiceClient = guild.voice_client  # type: ignore[assignment]
 
         try:
-            source = discord.FFmpegOpusAudio(song.url, **FFMPEG_OPTS)
+            source = discord.FFmpegOpusAudio(song.url, executable=FFMPEG_PATH, **FFMPEG_OPTS)
         except Exception:
             # Re-extract in case the stream URL expired
             try:
@@ -361,7 +380,7 @@ class Music(commands.Cog):
                     song.web_url, requester=song.requester, loop=self.bot.loop
                 )
                 song.url = fresh.url
-                source = discord.FFmpegOpusAudio(song.url, **FFMPEG_OPTS)
+                source = discord.FFmpegOpusAudio(song.url, executable=FFMPEG_PATH, **FFMPEG_OPTS)
             except Exception as exc:
                 log.error("Failed to re-extract %s: %s", song.title, exc)
                 await self._advance(guild)
