@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import logging
 import random
 import re
@@ -127,14 +128,57 @@ AUTOPLAY_PRESETS: dict[str, str] = {
 
 
 @dataclass
+class HistoryEntry:
+    url: str
+    artist: str
+    song_name: str
+
+
+@dataclass
 class GuildState:
     queue: list[Song] = field(default_factory=list)
     current: Song | None = None
     loop: int = LoopMode.OFF
     autoplay: bool = True
     autoplay_tag: str = ""
-    history: list[str] = field(default_factory=list)
+    artist_variety: bool = True
+    history: list[HistoryEntry] = field(default_factory=list)
     _inactivity_task: asyncio.Task | None = field(default=None, repr=False)
+    _prefetch_task: asyncio.Task | None = field(default=None, repr=False)
+    _prefetched_song: Song | None = field(default=None, repr=False)
+
+
+# ---------------------------------------------------------------------------
+# Similarity helpers
+# ---------------------------------------------------------------------------
+
+_TITLE_SEPARATORS = re.compile(r"\s*[-–—_/|]\s*")
+
+SONG_SIMILARITY_THRESHOLD = 0.75
+ARTIST_SIMILARITY_THRESHOLD = 0.80
+
+
+def _parse_artist_title(raw_title: str) -> tuple[str, str]:
+    """Try to split a YouTube title into (artist, song_name).
+    Returns ("", cleaned_title) if parsing fails."""
+    cleaned = re.sub(r"\[.*?]|\(.*?\)", "", raw_title)
+    cleaned = re.sub(r"(?i)(official|music|video|mv|lyrics?|audio|hd|4k|feat\.?)", "", cleaned)
+    cleaned = cleaned.strip()
+
+    parts = _TITLE_SEPARATORS.split(cleaned, maxsplit=1)
+    if len(parts) == 2 and len(parts[0].strip()) > 1 and len(parts[1].strip()) > 1:
+        return parts[0].strip(), parts[1].strip()
+    return "", cleaned
+
+
+def _normalize(text: str) -> str:
+    return re.sub(r"[^\w]", "", text.lower())
+
+
+def _similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, _normalize(a), _normalize(b)).ratio()
 
 
 # ---------------------------------------------------------------------------
@@ -358,9 +402,13 @@ class Music(commands.Cog):
             await self._start_playing(guild, song)
             return
 
-        # Autoplay – find a similar song
+        # Autoplay – use prefetched song or search now
         if state.autoplay and state.current:
-            auto_song = await self._find_similar(state.current, state)
+            if state._prefetched_song:
+                auto_song = state._prefetched_song
+                state._prefetched_song = None
+            else:
+                auto_song = await self._find_similar(state.current, state)
             if auto_song:
                 await self._start_playing(guild, auto_song)
                 return
@@ -388,12 +436,16 @@ class Music(commands.Cog):
                 return
 
         state.current = song
-        state.history.append(song.web_url)
-        if len(state.history) > 30:
-            state.history = state.history[-30:]
+        artist, song_name = _parse_artist_title(song.title)
+        state.history.append(HistoryEntry(url=song.web_url, artist=artist, song_name=song_name))
+        if len(state.history) > 50:
+            state.history = state.history[-50:]
 
         self._cancel_inactivity_timer(state)
         vc.play(source, after=lambda e: self._play_next(guild, e))
+
+        if state.autoplay and not state.queue:
+            self._schedule_prefetch(guild)
 
     # ------------------------------------------------------------------
     # Autoplay – similar song discovery
@@ -410,12 +462,38 @@ class Music(commands.Cog):
         except Exception:
             return None
 
-        # Filter out recently played songs
-        history_set = set(state.history)
-        candidates = [r for r in results if r["url"] not in history_set]
+        history_urls = {h.url for h in state.history}
+        candidates = []
+
+        for r in results:
+            if r["url"] in history_urls:
+                continue
+
+            cand_artist, cand_song_name = _parse_artist_title(r["title"])
+
+            # Same song check (always block) – compare against all history
+            if any(
+                _similarity(cand_song_name, h.song_name) >= SONG_SIMILARITY_THRESHOLD
+                for h in state.history
+                if h.song_name
+            ):
+                continue
+
+            # Artist variety check – compare against last 5 songs
+            if state.artist_variety and cand_artist:
+                recent = state.history[-5:]
+                if any(
+                    h.artist and _similarity(cand_artist, h.artist) >= ARTIST_SIMILARITY_THRESHOLD
+                    for h in recent
+                ):
+                    continue
+
+            candidates.append(r)
+
+        if not candidates:
+            candidates = [r for r in results if r["url"] not in history_urls]
         if not candidates:
             candidates = results
-
         if not candidates:
             return None
 
@@ -426,6 +504,38 @@ class Music(commands.Cog):
             return auto_song
         except Exception:
             return None
+
+    # ------------------------------------------------------------------
+    # Prefetch – search next song before current one ends
+    # ------------------------------------------------------------------
+
+    def _cancel_prefetch(self, state: GuildState) -> None:
+        if state._prefetch_task and not state._prefetch_task.done():
+            state._prefetch_task.cancel()
+        state._prefetched_song = None
+
+    def _schedule_prefetch(self, guild: discord.Guild) -> None:
+        state = self._state(guild)
+        self._cancel_prefetch(state)
+        song = state.current
+        if not song or song.duration < 20 or not state.autoplay:
+            return
+        if state.loop == LoopMode.SINGLE:
+            return
+        state._prefetch_task = asyncio.create_task(self._prefetch_worker(guild, song))
+
+    async def _prefetch_worker(self, guild: discord.Guild, song: Song) -> None:
+        delay = max(song.duration - 15, 0)
+        await asyncio.sleep(delay)
+
+        state = self._state(guild)
+        if state.queue or not state.autoplay or state.current != song:
+            return
+
+        auto_song = await self._find_similar(song, state)
+        if auto_song:
+            state._prefetched_song = auto_song
+            log.info("Prefetched next song: %s", auto_song.title)
 
     # ------------------------------------------------------------------
     # Embed helpers
@@ -567,9 +677,11 @@ class Music(commands.Cog):
         if not vc:
             await interaction.response.send_message("봇이 음성 채널에 없습니다.", ephemeral=True)
             return
-        self._state(interaction.guild).queue.clear()
-        self._state(interaction.guild).current = None
-        self._state(interaction.guild).loop = LoopMode.OFF
+        state = self._state(interaction.guild)
+        state.queue.clear()
+        state.current = None
+        state.loop = LoopMode.OFF
+        self._cancel_prefetch(state)
         vc.stop()
         await interaction.response.send_message("⏹️ 재생이 중지되고 대기열이 초기화되었습니다.")
 
@@ -619,7 +731,8 @@ class Music(commands.Cog):
         loop_label = LoopMode.label(state.loop)
         autoplay_label = "켜짐" if state.autoplay else "꺼짐"
         tag_info = f" ({state.autoplay_tag})" if state.autoplay_tag else ""
-        embed.set_footer(text=f"반복: {loop_label} | 자동재생: {autoplay_label}{tag_info} | 총 {len(state.queue)}곡 대기 중")
+        variety_label = "켜짐" if state.artist_variety else "꺼짐"
+        embed.set_footer(text=f"반복: {loop_label} | 자동재생: {autoplay_label}{tag_info} | 다양성: {variety_label} | 총 {len(state.queue)}곡 대기 중")
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="remove", description="대기열에서 특정 곡을 제거합니다.")
@@ -659,7 +772,7 @@ class Music(commands.Cog):
         await interaction.response.send_message(f"🔀 대기열 {len(state.queue)}곡을 셔플했습니다.")
 
     @app_commands.command(name="autoplay", description="자동재생을 켜거나 끄고, 선호 장르를 설정합니다.")
-    @app_commands.describe(genre="선호 장르 (비워두면 토글, 'off'로 태그 해제)")
+    @app_commands.describe(genre="선호 장르 (비워두면 토글, 'off'=태그해제, 'variety'=같은가수 차단 토글)")
     async def autoplay(self, interaction: discord.Interaction, genre: str | None = None) -> None:
         state = self._state(interaction.guild)
 
@@ -667,7 +780,10 @@ class Music(commands.Cog):
             state.autoplay = not state.autoplay
             label = "켜짐" if state.autoplay else "꺼짐"
             tag_info = f" (장르: {state.autoplay_tag})" if state.autoplay_tag else ""
-            await interaction.response.send_message(f"📻 자동재생: **{label}**{tag_info}")
+            variety_label = "켜짐" if state.artist_variety else "꺼짐"
+            await interaction.response.send_message(
+                f"📻 자동재생: **{label}**{tag_info} | 가수 다양성: **{variety_label}**"
+            )
             return
 
         genre_input = genre.strip()
@@ -675,6 +791,15 @@ class Music(commands.Cog):
         if genre_input.lower() == "off":
             state.autoplay_tag = ""
             await interaction.response.send_message("📻 자동재생 장르 태그가 해제되었습니다.")
+            return
+
+        if genre_input.lower() == "variety":
+            state.artist_variety = not state.artist_variety
+            label = "켜짐" if state.artist_variety else "꺼짐"
+            await interaction.response.send_message(
+                f"📻 가수 다양성: **{label}**\n"
+                f"{'연속으로 같은 가수의 곡이 추천되지 않습니다.' if state.artist_variety else '같은 가수의 곡도 자유롭게 추천됩니다.'}"
+            )
             return
 
         resolved = AUTOPLAY_PRESETS.get(genre_input, genre_input)
@@ -685,7 +810,7 @@ class Music(commands.Cog):
         await interaction.response.send_message(
             f"📻 자동재생: **켜짐** | 장르: **{genre_input}** (`{resolved}`)\n"
             f"사용 가능한 프리셋: {preset_list}\n"
-            f"프리셋 외 직접 입력도 가능합니다."
+            f"프리셋 외 직접 입력도 가능합니다. | `variety`로 가수 다양성 토글"
         )
 
     # ------------------------------------------------------------------
