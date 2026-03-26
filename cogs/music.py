@@ -41,6 +41,8 @@ FFMPEG_OPTS: dict = {
 
 INACTIVITY_TIMEOUT = 180  # seconds
 
+_URL_PATTERN = re.compile(r"^https?://")
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -126,6 +128,126 @@ def _keywords_from_title(title: str) -> str:
     cleaned = re.sub(r"[^\w\s]", "", cleaned)
     tokens = cleaned.split()
     return " ".join(tokens[:6])
+
+
+# ---------------------------------------------------------------------------
+# UI Views
+# ---------------------------------------------------------------------------
+
+class SearchSelectView(discord.ui.View):
+    """Presents numbered buttons (1-5) for the user to pick a search result."""
+
+    def __init__(self, results: list[dict], requester: discord.Member, cog: Music, timeout: float = 30):
+        super().__init__(timeout=timeout)
+        self.results = results
+        self.requester = requester
+        self.cog = cog
+        self.picked: dict | None = None
+        self.interaction_response: discord.Interaction | None = None
+
+        for i in range(min(len(results), 5)):
+            self.add_item(SearchButton(index=i, label=str(i + 1)))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester.id:
+            await interaction.response.send_message("요청자만 선택할 수 있습니다.", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True  # type: ignore[union-attr]
+        if self.interaction_response:
+            try:
+                await self.interaction_response.edit_original_response(view=self)
+            except Exception:
+                pass
+
+
+class SearchButton(discord.ui.Button["SearchSelectView"]):
+    def __init__(self, index: int, label: str):
+        super().__init__(style=discord.ButtonStyle.primary, label=label)
+        self.index = index
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.view.picked = self.view.results[self.index]
+        for child in self.view.children:
+            child.disabled = True  # type: ignore[union-attr]
+        await interaction.response.edit_message(view=self.view)
+        self.view.stop()
+
+
+class SkipVoteView(discord.ui.View):
+    """A persistent button for skip voting."""
+
+    def __init__(self, cog: Music, guild: discord.Guild, required: int, timeout: float = 60):
+        super().__init__(timeout=timeout)
+        self.cog = cog
+        self.guild = guild
+        self.required = required
+        self.voters: set[int] = set()
+        self.resolved = False
+        self.message: discord.Message | None = None
+
+    def _vote_label(self) -> str:
+        return f"스킵 투표 ({len(self.voters)}/{self.required})"
+
+    @discord.ui.button(label="스킵 투표 (0/0)", style=discord.ButtonStyle.danger, emoji="⏭️")
+    async def vote_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        vc = self.guild.voice_client
+        if not vc or not vc.channel:
+            await interaction.response.send_message("봇이 음성 채널에 없습니다.", ephemeral=True)
+            return
+
+        if not interaction.user.voice or interaction.user.voice.channel != vc.channel:
+            await interaction.response.send_message("같은 음성 채널에 있어야 투표할 수 있습니다.", ephemeral=True)
+            return
+
+        self.voters.add(interaction.user.id)
+
+        # Recalculate required in case people left/joined
+        humans = [m for m in vc.channel.members if not m.bot]
+        self.required = math.ceil(len(humans) / 2)
+        button.label = self._vote_label()
+
+        if len(self.voters) >= self.required:
+            self.resolved = True
+            button.label = "스킵 투표 통과!"
+            button.disabled = True
+            button.style = discord.ButtonStyle.success
+            await interaction.response.edit_message(view=self)
+            self.stop()
+
+            state = self.cog._state(self.guild)
+            state.skip_votes.clear()
+            if vc.is_playing():
+                vc.stop()
+        else:
+            voter_names = []
+            for vid in self.voters:
+                member = self.guild.get_member(vid)
+                if member:
+                    voter_names.append(member.display_name)
+            embed = interaction.message.embeds[0] if interaction.message.embeds else None
+            if embed:
+                for i, f in enumerate(embed.fields):
+                    if f.name == "투표 현황":
+                        embed.set_field_at(i, name="투표 현황", value=", ".join(voter_names) or "-", inline=False)
+                        break
+                await interaction.response.edit_message(embed=embed, view=self)
+            else:
+                await interaction.response.edit_message(view=self)
+
+    async def on_timeout(self) -> None:
+        if not self.resolved:
+            for child in self.children:
+                child.disabled = True  # type: ignore[union-attr]
+                child.label = "투표 시간 만료"  # type: ignore[union-attr]
+            if self.message:
+                try:
+                    await self.message.edit(view=self)
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -341,11 +463,47 @@ class Music(commands.Cog):
         if not vc:
             vc = await interaction.user.voice.channel.connect(self_deaf=True)
 
-        try:
-            song = await extract_song(query, requester=interaction.user, loop=self.bot.loop)
-        except Exception as exc:
-            await interaction.followup.send(f"노래를 찾을 수 없습니다: {exc}")
-            return
+        is_url = bool(_URL_PATTERN.match(query.strip()))
+
+        if not is_url:
+            # Search mode: show 5 results and let user pick via buttons
+            results = await search_youtube(query, loop=self.bot.loop)
+            if not results:
+                await interaction.followup.send("검색 결과가 없습니다.")
+                return
+
+            lines: list[str] = []
+            for i, r in enumerate(results[:5], 1):
+                dur = r["duration"]
+                m, s = divmod(dur, 60)
+                lines.append(f"`{i}.` {r['title']} ({m:02d}:{s:02d})")
+
+            embed = discord.Embed(
+                title=f"🔍 검색 결과: {query}",
+                description="\n".join(lines),
+                color=discord.Color.blue(),
+            )
+            embed.set_footer(text="30초 내에 버튼을 눌러 선택하세요.")
+
+            view = SearchSelectView(results[:5], interaction.user, self)
+            msg = await interaction.followup.send(embed=embed, view=view)
+            view.interaction_response = interaction
+
+            timed_out = await view.wait()
+            if timed_out or view.picked is None:
+                return
+
+            try:
+                song = await extract_song(view.picked["url"], requester=interaction.user, loop=self.bot.loop)
+            except Exception as exc:
+                await interaction.followup.send(f"노래를 불러올 수 없습니다: {exc}")
+                return
+        else:
+            try:
+                song = await extract_song(query, requester=interaction.user, loop=self.bot.loop)
+            except Exception as exc:
+                await interaction.followup.send(f"노래를 찾을 수 없습니다: {exc}")
+                return
 
         state = self._state(interaction.guild)
 
@@ -407,21 +565,36 @@ class Music(commands.Cog):
             await interaction.response.send_message("같은 음성 채널에 있어야 합니다.", ephemeral=True)
             return
 
-        state = self._state(interaction.guild)
-        state.skip_votes.add(interaction.user.id)
-
         humans = [m for m in vc.channel.members if not m.bot]
         required = math.ceil(len(humans) / 2)
-        current_votes = len(state.skip_votes)
 
-        if current_votes >= required:
+        # 혼자 있는 경우 즉시 스킵
+        if required <= 1:
+            state = self._state(interaction.guild)
             state.skip_votes.clear()
-            vc.stop()  # triggers _play_next
-            await interaction.response.send_message("⏭️ 투표 통과! 다음 곡으로 넘어갑니다.")
-        else:
-            await interaction.response.send_message(
-                f"⏭️ 스킵 투표: **{current_votes}/{required}** (채널 인원의 과반수 필요)"
-            )
+            vc.stop()
+            await interaction.response.send_message("⏭️ 다음 곡으로 넘어갑니다.")
+            return
+
+        state = self._state(interaction.guild)
+        current_title = state.current.title if state.current else "현재 곡"
+
+        view = SkipVoteView(cog=self, guild=interaction.guild, required=required, timeout=60)
+        view.voters.add(interaction.user.id)
+        view.vote_button.label = view._vote_label()
+
+        embed = discord.Embed(
+            title="⏭️ 스킵 투표",
+            description=f"**{current_title}**\n\n"
+                        f"채널 인원의 과반수({required}명)가 투표하면 스킵됩니다.\n"
+                        f"아래 버튼을 클릭하거나 `/skip`을 입력해 투표하세요.",
+            color=discord.Color.red(),
+        )
+        embed.add_field(name="투표 현황", value=interaction.user.display_name, inline=False)
+
+        await interaction.response.send_message(embed=embed, view=view)
+        msg = await interaction.original_response()
+        view.message = msg
 
     # ------------------------------------------------------------------
     # Queue management
@@ -530,36 +703,21 @@ class Music(commands.Cog):
             description="\n".join(lines),
             color=discord.Color.blue(),
         )
-        embed.set_footer(text="30초 내에 번호를 입력해 선택하세요. (취소: c)")
+        embed.set_footer(text="30초 내에 버튼을 눌러 선택하세요.")
 
-        await interaction.followup.send(embed=embed)
+        view = SearchSelectView(results[:5], interaction.user, self)
+        await interaction.followup.send(embed=embed, view=view)
+        view.interaction_response = interaction
 
-        def check(m: discord.Message) -> bool:
-            return (
-                m.author == interaction.user
-                and m.channel == interaction.channel
-                and (m.content.lower() in ("c", "cancel") or m.content.isdigit())
-            )
-
-        try:
-            msg = await self.bot.wait_for("message", check=check, timeout=30)
-        except asyncio.TimeoutError:
+        timed_out = await view.wait()
+        if timed_out or view.picked is None:
             return
 
-        if msg.content.lower() in ("c", "cancel"):
-            await msg.reply("검색이 취소되었습니다.")
-            return
-
-        choice = int(msg.content)
-        if choice < 1 or choice > len(results):
-            await msg.reply("잘못된 번호입니다.")
-            return
-
-        picked = results[choice - 1]
+        picked = view.picked
         try:
             song = await extract_song(picked["url"], requester=interaction.user, loop=self.bot.loop)
         except Exception as exc:
-            await msg.reply(f"노래를 불러올 수 없습니다: {exc}")
+            await interaction.followup.send(f"노래를 불러올 수 없습니다: {exc}")
             return
 
         vc: discord.VoiceClient | None = interaction.guild.voice_client
@@ -569,10 +727,10 @@ class Music(commands.Cog):
         state = self._state(interaction.guild)
         if vc.is_playing() or vc.is_paused():
             state.queue.append(song)
-            await msg.reply(f"대기열에 추가: **{song.title}**")
+            await interaction.followup.send(f"대기열에 추가: **{song.title}**")
         else:
             await self._start_playing(interaction.guild, song)
-            await msg.reply(embed=self._now_playing_embed(song))
+            await interaction.followup.send(embed=self._now_playing_embed(song))
 
     # ------------------------------------------------------------------
     # Now Playing
