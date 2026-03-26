@@ -32,7 +32,7 @@ YDL_SEARCH_OPTS: dict = {**YDL_BASE_OPTS, "default_search": "ytsearch5", "extrac
 
 YDL_EXTRACT_OPTS: dict = {
     **YDL_BASE_OPTS,
-    "format": "bestaudio/best",
+    "format": "bestaudio[acodec=opus]/bestaudio/best",
     "default_search": "ytsearch",
 }
 
@@ -63,9 +63,15 @@ def _find_ffmpeg() -> str:
 
 FFMPEG_PATH: str = _find_ffmpeg()
 
+FFMPEG_BEFORE = (
+    "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+    "-analyzeduration 3000000 -probesize 500000"
+)
+
 FFMPEG_OPTS: dict = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    "before_options": FFMPEG_BEFORE,
     "options": "-vn",
+    "bitrate": 192,
 }
 
 INACTIVITY_TIMEOUT = 180  # seconds
@@ -119,10 +125,13 @@ class GuildState:
 # Helpers
 # ---------------------------------------------------------------------------
 
+_ydl_extract = yt_dlp.YoutubeDL(YDL_EXTRACT_OPTS)
+_ydl_search = yt_dlp.YoutubeDL(YDL_SEARCH_OPTS)
+
+
 async def extract_song(query: str, *, requester: discord.Member | None, loop: asyncio.AbstractEventLoop) -> Song:
     """Extract song info from a URL or search query."""
-    with yt_dlp.YoutubeDL(YDL_EXTRACT_OPTS) as ydl:
-        data = await loop.run_in_executor(None, lambda: ydl.extract_info(query, download=False))
+    data = await loop.run_in_executor(None, lambda: _ydl_extract.extract_info(query, download=False))
     if "entries" in data:
         data = data["entries"][0]
     return Song(
@@ -136,8 +145,7 @@ async def extract_song(query: str, *, requester: discord.Member | None, loop: as
 
 async def search_youtube(query: str, *, loop: asyncio.AbstractEventLoop) -> list[dict]:
     """Return flat search results (title, url, duration)."""
-    with yt_dlp.YoutubeDL(YDL_SEARCH_OPTS) as ydl:
-        data = await loop.run_in_executor(None, lambda: ydl.extract_info(query, download=False))
+    data = await loop.run_in_executor(None, lambda: _ydl_search.extract_info(query, download=False))
     entries = list(data.get("entries", []))
     return [
         {
