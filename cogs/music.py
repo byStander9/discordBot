@@ -40,13 +40,24 @@ def _find_ffmpeg() -> str:
     found = shutil.which("ffmpeg")
     if found:
         return found
-    common_paths = [
+
+    import glob
+    search_patterns = [
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WinGet", "Packages", "*FFmpeg*", "**", "ffmpeg.exe"),
         r"C:\ffmpeg\bin\ffmpeg.exe",
         r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+        r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
+        os.path.join(os.environ.get("USERPROFILE", ""), "scoop", "shims", "ffmpeg.exe"),
     ]
-    for p in common_paths:
-        if os.path.isfile(p):
-            return p
+    for pattern in search_patterns:
+        if "*" in pattern or "?" in pattern:
+            matches = glob.glob(pattern, recursive=True)
+            if matches:
+                return matches[0]
+        elif os.path.isfile(pattern):
+            return pattern
+
+    log.warning("FFmpeg not found! Audio playback will not work.")
     return "ffmpeg"
 
 
