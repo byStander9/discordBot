@@ -76,7 +76,21 @@ FFMPEG_OPTS: dict = {
 
 INACTIVITY_TIMEOUT = 180  # seconds
 
+AUTOPLAY_MIN_DURATION = 30    # skip clips/shorts under 30s
+AUTOPLAY_MAX_DURATION = 900   # skip podcasts/compilations over 15min
+
 _URL_PATTERN = re.compile(r"^https?://")
+_YT_VIDEO_ID = re.compile(r"(?:v=|youtu\.be/|/embed/|/shorts/)([a-zA-Z0-9_-]{11})")
+
+
+def _video_id(url: str) -> str:
+    """Extract YouTube video ID for reliable comparison."""
+    m = _YT_VIDEO_ID.search(url)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r"[a-zA-Z0-9_-]{11}", url):
+        return url
+    return url
 
 
 # ---------------------------------------------------------------------------
@@ -455,23 +469,36 @@ class Music(commands.Cog):
         keywords = _keywords_from_title(song.title)
         if not keywords.strip():
             return None
+
         if state.autoplay_tag:
-            keywords = f"{keywords} {state.autoplay_tag}"
+            search_terms = f"{keywords} {state.autoplay_tag}"
+        else:
+            search_terms = f"{keywords} music"
+
         try:
-            results = await search_youtube(keywords, loop=self.bot.loop)
+            results = await search_youtube(
+                f"ytsearch10:{search_terms}", loop=self.bot.loop,
+            )
         except Exception:
+            log.warning("Autoplay search failed for: %s", search_terms)
             return None
 
-        history_urls = {h.url for h in state.history}
+        current_vid = _video_id(song.web_url)
+        history_vids = {_video_id(h.url) for h in state.history}
         candidates = []
 
         for r in results:
-            if r["url"] in history_urls:
+            r_vid = _video_id(r["url"])
+
+            if r_vid == current_vid or r_vid in history_vids:
+                continue
+
+            dur = r["duration"]
+            if dur > 0 and (dur < AUTOPLAY_MIN_DURATION or dur > AUTOPLAY_MAX_DURATION):
                 continue
 
             cand_artist, cand_song_name = _parse_artist_title(r["title"])
 
-            # Same song check (always block) – compare against all history
             if any(
                 _similarity(cand_song_name, h.song_name) >= SONG_SIMILARITY_THRESHOLD
                 for h in state.history
@@ -479,7 +506,6 @@ class Music(commands.Cog):
             ):
                 continue
 
-            # Artist variety check – compare against last 5 songs
             if state.artist_variety and cand_artist:
                 recent = state.history[-5:]
                 if any(
@@ -491,13 +517,21 @@ class Music(commands.Cog):
             candidates.append(r)
 
         if not candidates:
-            candidates = [r for r in results if r["url"] not in history_urls]
+            candidates = [
+                r for r in results
+                if _video_id(r["url"]) != current_vid
+                and _video_id(r["url"]) not in history_vids
+            ]
         if not candidates:
-            candidates = results
+            candidates = [
+                r for r in results if _video_id(r["url"]) != current_vid
+            ]
         if not candidates:
+            log.info("Autoplay: no valid candidates found for '%s'", song.title)
             return None
 
         pick = random.choice(candidates[:3])
+        log.info("Autoplay pick: %s (from %d candidates)", pick["title"], len(candidates))
         try:
             auto_song = await extract_song(pick["url"], requester=None, loop=self.bot.loop)
             auto_song.is_autoplay = True
